@@ -1,0 +1,512 @@
+##### List Of Libraries ########
+library(ggplot2)
+library(gplots)
+library(caTools)
+library(lattice)
+library(caret)
+library(foreach)
+library(Matrix)
+library(pROC)
+library(ROCR)
+library(Rcpp)
+library(mice)
+library(xgboost)
+library(survival)
+library(splines)
+library(parallel)
+library(gbm) 
+library(randomForest)
+library(data.table)
+library(h2o)
+library(dplyr)
+
+
+
+######### set Wordking Directory ##
+
+setwd("~/Desktop/CAX_TestSet")### set the path  
+
+
+######### Loading Data ############
+start_time <- Sys.time()
+train_14_1 <- fread('CAX_Train_2014_Jan_to_Jun.csv')
+train_14_2 <- fread('CAX_Train_2014_Jul_to_Dec.csv')
+train_15_1 <- fread('CAX_Train_2015.csv')
+test<- fread('CAX_TestSet.csv')
+
+train_all <- rbind(train_14_1,train_14_2,train_15_1) ### combined train of ~85 Lakh entries to exctract features
+
+######## taking a stratified sample of 14 L entries out of complete ~85L entries for model training ###########
+set.seed(321)
+split <- sample.split(train_14_2$ARR_DEL15,0.5)
+sample_train_14_2 <- subset(train_14_2,split == T)
+
+sample_train1 <- train_14_1[sample(nrow(train_14_1),450000),] #### taking a random sample of 4.5 L entries from train_14 jan to june
+sample_train2 <- sample_train_14_2[sample(nrow(sample_train_14_2),500000),] #### taking a random sample of 5 L entries from train_14 july to Dec
+sample_train3 <- train_15_1[sample(nrow(train_15_1),450000),] #### taking a random sample of 4.5 L entries from train_15 jan to june
+
+sample_train <- rbind(sample_train1,sample_train2,sample_train3) ### (4.5 + 5 + 4.5 = 14 L)
+
+### remove unwanted data frames to free memory
+rm(sample_train_14_2)
+rm(sample_train1,sample_train2,sample_train3)
+rm(train_14_1,train_14_2,train_15_1)
+
+#### writing target variable into a new vector
+target <- sample_train$ARR_DEL15 
+sample_train$ARR_DEL15 <- NULL
+test$ARR_DEL15 <- NULL
+target_train_all <- train_all$ARR_DEL15
+nrow_train_all <- nrow(train_all)
+#### combining sample_train and test for data transformations ######
+combined <- rbind(sample_train,test)
+rm(sample_train)
+
+combined$FL_DATE <- as.Date(combined$FL_DATE) ### converting to date format
+
+#### Derived Variable 1 : Speed = Distance/Time
+combined$speed <- combined$DISTANCE/combined$CRS_ELAPSED_TIME
+
+#### Derived Variable 2 : ROUTE := Unique combination of Origin and Destination Airports
+#### please note that we have considered JFK - LAS and LAS - JFK are two different routes
+combined$route <-  paste(combined$ORIGIN,combined$DEST,sep = '')
+
+######################################################################################
+#++++++++++++++++++++++++++++++++   NEW FEATURES  +++++++++++++++++++++++++++++++++++#
+######################################################################################
+
+###### USING LARGE FACTOR VARIABLES TO CREATE NEW NUMERICAL FEATURES ##########
+
+
+#================
+#     ROUTE 
+#================
+
+train_all$FL_DATE <- as.Date(train_all$FL_DATE)
+train_all$route <- paste(train_all$ORIGIN,train_all$DEST,sep = '') #### ~4800 distinct routes
+
+######### LOOK HOW DIIFERENT SOURCE-DESTINATION COMBINATIONS HAVE DIFFERENT AVERAGE PERCENTAGE OF DELAYS ########### 
+m = as.matrix(table(train_all$route ,train_all$ARR_DEL15))
+
+######## CALCULATE THE PERCENTAGE DELAY AND THE TOTAL NUMBER OF FLIGHTS IN THAT PARTICULAR ROUTE FOR EACH COMBINATION 
+d <-cbind(as.data.frame(m[,2]/(m[,2]+m[,1])),as.data.frame(m[,2]+m[,1]))
+
+##### (m[,2]/(m[,2]+m[,1])) <- historic delay <=> count of delayed flights in the route from 2014 jan till 2015_june / total flights in the route 2014 jan till 2015_june
+##### ((m[,2]+m[,1])) <- historic traffic in the route <=> total count of flights in the route from 2014 jan till 2015_june
+##### <=> higher (m[,2]+m[,1]), more flights in the route <=> busier route
+
+dt <- as.data.frame(setDT(d,keep.rownames = T))
+
+colnames(dt)[3] <- 'SOURCE_DEST_COUNT'
+colnames(dt)[2] <- 'perc_delay_source_dest'
+colnames(dt)[1] <- 'route'
+
+head(dt) 
+#### as one can see the route ABQ-ATL has an average delay of 11% where as that of ABI-DFW is 21%
+
+### we left join this table with the combined table to create new variable :- 'perc_delay_source_dest','SOURCE_DEST_COUNT' & 'decile_SD'
+## the new variable "perc_delay_source_dest" has a value of 0.11 wherever the route is ABQ-ATL
+## and 0.21 wherever the route is ABI-DFW respectively. 
+
+
+#================
+#   TAIL NUMBER  
+#================
+
+m2 = as.matrix(table(train_all$TAIL_NUM ,train_all$ARR_DEL15))
+
+######## CALCULATE THE PERCENTAGE DELAY AND THE TOTAL NUMBER OF INSTANCES FOR EACH "TAIL NUMBER"
+
+d2 <-cbind(as.data.frame(m2[,2]/(m2[,2]+m2[,1])),as.data.frame(m2[,2]+m2[,1]))
+
+dt2 <- as.data.frame(setDT(d2,keep.rownames = T))
+
+colnames(dt2)[3] <- 'TAIL_COUNT'
+colnames(dt2)[2] <- 'perc_delay_tail'
+colnames(dt2)[1] <- 'TAIL_NUM'
+
+head(dt2)
+
+#### as one can see the TAIL_NUMBER D942DN has an average delay of 17.2% where as that of N001AA is 25.4%
+
+
+
+#summary(combined)
+
+#================
+#   DEP_TIME_BLK /// some dep_times are more prone to delay than other
+#================
+
+m3 = as.matrix(table(train_all$DEP_TIME_BLK ,train_all$ARR_DEL15))
+d3 <-cbind(as.data.frame(m3[,2]/(m3[,2]+m3[,1])))
+dt3 <- as.data.frame(setDT(d3,keep.rownames = T))
+
+colnames(dt3)[2] <- 'DEP_TIME_BLK_perc_delay'
+colnames(dt3)[1] <- 'DEP_TIME_BLK'
+
+dt3
+
+
+#================
+#   ARR_TIME_BLK /// some arr_times are more prone to delay than other
+#================
+
+
+m4 = as.matrix(table(train_all$ARR_TIME_BLK ,train_all$ARR_DEL15))
+d4 <-cbind(as.data.frame(m4[,2]/(m4[,2]+m4[,1])))
+dt4 <- as.data.frame(setDT(d4,keep.rownames = T))
+colnames(dt4)[2] <- 'ARR_TIME_BLK_perc_delay'
+colnames(dt4)[1] <- 'ARR_TIME_BLK'
+
+dt4
+
+
+#================
+#   DAY_OF_MONTH /// some DAYS_OF_MONTH are more prone to delay than other
+#================
+
+m5 = as.matrix(table(train_all$DAY_OF_MONTH ,train_all$ARR_DEL15))
+d5 <-cbind(as.data.frame(m5[,2]/(m5[,2]+m5[,1])))
+dt5 <- as.data.frame(setDT(d5,keep.rownames = T))
+colnames(dt5)[2] <- 'DAY_OF_MONTH_perc_delay'
+colnames(dt5)[1] <- 'DAY_OF_MONTH'
+dt5
+
+
+#================
+#   DAY_OF_WEEK /// some DAYs_OF_WEEK are more prone to delay than other
+#================
+
+m6 = as.matrix(table(train_all$DAY_OF_WEEK ,train_all$ARR_DEL15))
+d6 <-cbind(as.data.frame(m6[,2]/(m6[,2]+m6[,1])))
+dt6 <- as.data.frame(setDT(d6,keep.rownames = T))
+colnames(dt6)[2] <- 'DAY_OF_WEEK_perc_delay'
+colnames(dt6)[1] <- 'DAY_OF_WEEK'
+
+dt6
+
+#================
+#   UNIQUE_CARRIER /// some carriers are more prone to delay than other
+#================
+
+m7 = as.matrix(table(train_all$UNIQUE_CARRIER ,train_all$ARR_DEL15))
+
+d7 <-cbind(as.data.frame(m7[,2]/(m7[,2]+m7[,1])))
+
+dt7 <- as.data.frame(setDT(d7,keep.rownames = T))
+
+colnames(dt7)[2] <- 'Carrier_perc_delay'
+colnames(dt7)[1] <- 'UNIQUE_CARRIER'
+dt7
+
+
+###########################################
+#================
+# Origin/Destination Traffic <=> Number of flights dep/arriving 
+# in the same time block in the same airport gives a rough estimate 
+# of aiport traffic (runway availablity ? may be! :D ) 
+#================
+
+test$FL_DATE <- as.Date(test$FL_DATE)
+full <- data.table(rbind(as.data.frame(train_all)[,c(7,12,16,20,23)],as.data.frame(test)[,c(7,12,16,20,23)]))
+
+origin_traffic <- full[,.N,.(ORIGIN_AIRPORT_ID,FL_DATE,DEP_TIME_BLK)]
+
+destination_traffic <- full[,.N,.(DEST_AIRPORT_ID,FL_DATE,ARR_TIME_BLK)]
+
+rm(full)
+#=================================================
+#### Variable for repair / maintenance time for a 
+#### flight which just landed in an airport and has 
+#### to depart to another airport in few hours/minutes
+#=================================================
+
+#====================================================
+# Logic we used: 
+# Repair Time or Time available for a flight to get ready before its next journey:-
+# := (Departure time of the flight - Arrival Time of the same flight (same tail No) before this in the same day)
+# hence we created a lag variable to substract Arrival time of previous flight and dep time of this flight
+
+
+prev_fl_1 <- rbind(as.data.frame(train_all)[,c(1,7,9,19,22)],as.data.frame(test)[,c(1,7,9,19,22)])
+
+rm(train_all,test)
+## function to convert time in HHMM format to 
+## number of minutes elapsed since 00:00
+mins <- function(x){
+  floor(x/100)*60+x%%100
+}
+
+prev_fl_1$CRS_DEP_TIME_num <- mins(prev_fl_1$CRS_DEP_TIME)
+prev_fl_1$CRS_ARR_TIME_num <- mins(prev_fl_1$CRS_ARR_TIME)
+data <- data.table(prev_fl_1)
+
+data <- data[order(TAIL_NUM,FL_DATE,CRS_DEP_TIME_num),]
+nm1 <- colnames(data)[7]
+nm2 <- paste("lag", nm1, sep=".")
+## create lag variable: lag.CRS_ARR_TIME_num
+data <- data[, (nm2):=lapply(.SD, function(x) c(NA, x[-.N])), by=.(TAIL_NUM,FL_DATE), .SDcols=nm1]
+
+data$repair_time <- data$CRS_DEP_TIME_num - data$lag.CRS_ARR_TIME_num
+
+summary(data)
+### the case where the flight is the first flight of the day
+### the previous flight arrival time is Not Available 
+### hence the lag.CRS_ARR_TIME_num will have NAs in such cases
+### We assume in such cases the flight crew has ample time to 
+### complete the routine maintenance job, so those cases have
+###  be flaged with a high number '9999'
+
+data[is.na(data$repair_time),'repair_time'] = 9999
+
+#sum(data$repair_time>0 & data$repair_time< 9000)
+
+lag_flight_data <- as.data.frame(data)[,c(1,9)]
+rm(data)
+
+#=================================================
+#### Variable for 'n'th journey of a flight(with some tail number) on the same day
+#### There is obviously a difference between a flight which has 10 journeys a day
+#### and a flight which has only one jouney a day.
+#### For the flight with 10 journeys, the delay in the first few journeys will
+#### get added up and will result in a large delays in the last journeys of the day
+#=================================================
+
+#====================================================
+# Logic we used: 
+# In order to find which journey of the day the flight is currently in,
+# we used a simple rank function partitioned by tail_num,fl_date and ordered by dep time of each journey
+
+tail_rank <- data.table(prev_fl_1[,c(1:4)])
+tail_rank <- tail_rank[,tail.rank:=rank(CRS_DEP_TIME,ties.method="first"),by=.(TAIL_NUM,FL_DATE)]
+m20<- as.matrix(table(tail_rank$tail.rank[1:nrow_train_all],target_train_all) )
+
+d20 <-cbind(as.data.frame(m20[,2]/(m20[,2]+m20[,1])))
+dt20 <- as.data.frame(setDT(d20,keep.rownames = T))
+
+colnames(dt20)[2] <- 'tail_rank_perc_delay'
+colnames(dt20)[1] <- 'tail.rank'
+
+tail_rank$tail.rank = as.factor(tail_rank$tail.rank)
+tail_rank <- merge(tail_rank,dt20,by = 'tail.rank',all.x = T)
+tail_rank <- as.data.frame(tail_rank)[,c(2,6)]
+
+rm(prev_fl_1)
+
+new_features <- merge(tail_rank,lag_flight_data,by ='id')
+rm(tail_rank,lag_flight_data)
+
+
+combined$row_number <- 1:nrow(combined)
+
+
+
+combined <- merge(combined,dt,by = 'route',all.x = T) #### LEFT JOIN on ROUTE
+#### LEFT JOIN WITH COMBINED TABLE ON 'TAIL_NUM'
+combined <- merge(combined,dt2,by = 'TAIL_NUM',all.x = T)
+### Left Join of newly created numerical variable 'DEP_TIME_BLK_perc_delay'
+
+
+combined <- merge(combined,origin_traffic,by = c("FL_DATE","ORIGIN_AIRPORT_ID","DEP_TIME_BLK"),all.x = T)
+combined <- merge(combined,destination_traffic,by = c("FL_DATE","DEST_AIRPORT_ID","ARR_TIME_BLK"),all.x = T)
+rm(destination_traffic,origin_traffic)
+
+
+
+
+
+combined <- merge(combined,dt3,by = 'DEP_TIME_BLK',all.x = T)
+### Left Join of newly created numerical variable 'ARR_TIME_BLK_perc_delay'
+combined <- merge(combined,dt4,by = 'ARR_TIME_BLK',all.x = T)
+
+combined$DAY_OF_MONTH <- as.character(combined$DAY_OF_MONTH)
+combined <- merge(combined,dt5,by = 'DAY_OF_MONTH',all.x = T)
+
+combined$DAY_OF_WEEK <- as.character(combined$DAY_OF_WEEK)
+combined <- merge(combined,dt6,by = 'DAY_OF_WEEK',all.x = T)
+
+combined <- merge(combined,dt7,by = 'UNIQUE_CARRIER',all.x = T)
+
+#str(new_features)
+combined <- merge(combined,new_features,by ='id',all.x = T)
+rm(new_features)
+
+
+
+#As we can see that there are few NEW TAIL NUMBERS and NEW ROUTES which are present in the test data 
+#but absent in the train_all data. Hence the left join resulted in few NAs
+## Since the overall perc of NAs is negligable, We have imputed these NAs with the mean values for the sake of simplicity
+
+summary(combined)
+
+### function to replace NA with mean 
+replace_NA_mean <- function(dt,i){
+  df <- as.data.frame(dt)
+  me <- mean(df[!(is.na(df[,i])),i])
+  ifelse(is.na(df[,i]),me,df[,i])
+}
+x = as.data.frame(combined)
+for(i in 30:33){
+  x[,i] = replace_NA_mean(combined,i)
+}
+combined = data.table(x)
+rm(x)
+
+combined <- combined[order(combined$row_number),]
+
+
+#=====================
+# Multiplied delays 
+#=====================
+dt2[dt2$TAIL_NUM == 'N0EGMQ'| dt2$TAIL_NUM == 'N028AA', ]
+## Tail No : N0EGMQ - 34.7% past average delay  (variable name := perc_delay_source_dest)
+## Tail No : N028AA - 16.3% past average delay
+
+dt4[dt4$ARR_TIME_BLK == '0700-0759'|dt4$ARR_TIME_BLK == '2000-2059', ]
+## arrival Time block : '0700-0759' - 9.6% past average delay (variable name := ARR_TIME_BLK_perc_delay)
+## arrival Time block : '2000-2059' - 29% past average delay
+
+# So, if the flight with tail  number N0EGMQ (34.7% past avg delay) has an arrival time in between 20:00 - 20:59 (29% past average delay)
+# ,the probablity of flight getting delayed seems logically more as compared to a flight 
+# with tail  number N028AA (16.3% past avg delay) has an arrival time in between 07:00-07:59 (only 9.6% past average delay)
+# 34.7 * 29 >> 16.3 * 9.6 <==> more delay in first case
+# In order to capture this pattern, we created a series of multiplied delay variables as shown below,
+
+
+#corrplot(as.matrix(train1_delays))
+
+#cor(as.matrix(train1_delays))
+
+combined$Multiplied_delay <- 100000*combined$perc_delay_source_dest* combined$perc_delay_tail*combined$DEP_TIME_BLK_perc_delay*combined$ARR_TIME_BLK_perc_delay*combined$DAY_OF_MONTH_perc_delay*combined$DAY_OF_WEEK_perc_delay*combined$Carrier_perc_delay
+combined$Multiplied_delay_1 <- 1000*combined$perc_delay_source_dest* combined$perc_delay_tail*combined$Carrier_perc_delay                           
+# we believe tring out different other logical combinations of multiplied delay can improve model further.
+# Due to time constraint, we could nt do so
+combined$Multiplied_delay_2 <- 100*combined$ARR_TIME_BLK_perc_delay* combined$DEP_TIME_BLK_perc_delay  
+combined$Multiplied_delay_3 <- 100*combined$DAY_OF_MONTH_perc_delay*combined$DAY_OF_WEEK_perc_delay
+
+# since 
+combined$sum_log <- log(combined$SOURCE_DEST_COUNT) + log(combined$TAIL_COUNT) 
+
+####################
+
+
+############ PREPARING TEST AND TRAINING DATAFRAME WITH  ################
+################### ORIGINAL AND DERIVED VARIABLES ######################
+################# (NO WEATHER DATA INCLUDED AS OF NOW) ##################
+train_no_weather <- as.data.frame(combined)[1:1400000,c(2:6,13,14,23,25,26,27,28,30:47)]
+train_no_weather$target <- as.factor(target)
+
+test_no_weather <- as.data.frame(combined)[1400001:nrow(combined),c(2:6,13,14,23,25,26,27,28,30:47)]
+
+for(i in c(1:7,11))
+{
+  train_no_weather[,i] = as.factor(train_no_weather[,i])
+  test_no_weather[,i] = as.factor(test_no_weather[,i])
+}
+
+Sys.time() - start_time
+
+
+test_ids <- combined$id[1400001:nrow(combined)]
+rm(combined)
+################ GBM model using h2o package ################
+# Since the data is big, considering my machine limitations, 
+# running a gradient boosting model is computationally intensive 
+# but unfortunately gbm outperformed other computationally less intensive methods
+# Now that we have to deal with intensive nature of the algo, we might as well 
+# try some open source techniques to reduce the time it takes to train the model.
+
+# And Just like that h2o comes to the rescue!!!! 
+
+library(h2o)
+### initializes H2O instance
+### this requires 64 bit java environment in your computer
+h2o.init() 
+
+train.h2o <- as.h2o(train_no_weather)
+test.h2o <- as.h2o(test_no_weather)
+splits <- h2o.splitFrame(train.h2o, c(0.8), seed=1234)
+train  <- h2o.assign(splits[[1]], "train.hex") # 80%
+valid  <- h2o.assign(splits[[2]], "valid.hex") # 20%
+colnames(train.h2o)
+system.time(
+  model_1 <- 
+    h2o.gbm(y = 31,  x = c(1:30),   # column number for label
+            #model_id="gbm_model_first", 
+            training_frame=train, 
+            #validation_frame=valid,
+            ntrees = 2400,learn_rate = 0.01, max_depth = 5, seed = 1122
+    )
+)
+
+## while the model runs, we can look at its performance dynamically using h2o flow,
+## go to :: http://localhost:54321/ 
+
+# Summary of the Model #
+summary(model_1) 
+
+
+predict.gbm <- as.data.frame(h2o.predict(model_1, test.h2o))
+sub_gbm <- data.frame(id =test_ids, ARR_DEL15 =  predict.dl$p1)
+
+#write.csv(sub_gbm,'submission_gbm.csv',row.names = F)
+
+# once the model is succesfully trained and used for predictions, 
+# we can close the instance 
+h2o.shutdown()
+Y
+
+
+
+####################################################
+#++++++++++++ XGBOOST MODEL +++++++++++++++++++++++#
+####################################################
+
+# If there is a problem in setting up a h2o instance, a simple xgboost model can be run.
+# It gives similar results but, it takes longer time.
+
+
+
+# creation of test and train sparse matrices
+train_sp_1 <- sparse.model.matrix(~., data = train_no_weather[,-31])
+xgtrain_1 <- xgb.DMatrix(data = train_sp_1,label = target)
+
+test_sp_1 <- sparse.model.matrix(~., data = test_no_weather)
+xgtest_1 <- xgb.DMatrix(data = test_sp_1)
+
+rm(train_sp_1,test_sp_1)
+
+## Cross - Validation ###
+## Skip this if you want ##
+nrounds = 5000
+nfolds = 4
+ps = list( max_depth = 5 ,eta = 0.01,objective = "binary:logistic")
+ms = list( 'auc','error')
+
+cvXgb = xgb.cv(params = ps, data = xgtrain_1,
+               nrounds = nrounds ,nfold = nfolds,print.every.n = 1,showsd = T,
+               metrics = ms,stratified = F, verbose = T ,subsample = 1)
+
+
+#################################
+
+xgb_1 <- xgboost( data = xgtrain_1,
+                  #label = labelnum,
+                  nrounds = 2800, max_depth = 5 ,eta = 0.01,stratified = T,
+                  objective = "binary:logistic", metrics = 'auc', verbose=1,subsample = 0.8
+)
+pred_xgb_1 <- predict(xgb_1,newdata = xgtest_1)
+
+#summary(xgb_1)
+
+xgb_predictions <- as.data.frame(cbind(id =id =test_ids, ARR_DEL15 = pred_xgb_1))
+
+write.csv(xgb_predictions,'xgb_predictions.csv',row.names = F)
+
+##################################
+#Feature Importance XGBOOST
+
+xgb_importance = xgb.importance(feature_names = colnames(test_no_weather),model = xgb_1)
+xgb.plot.importance(xgb_importance)
+
+################
